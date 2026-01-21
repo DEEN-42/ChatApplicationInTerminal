@@ -4,6 +4,7 @@
 #include "ChatRoom.h"
 #include "ClientInfo.h"
 #include "Message.h"
+#include "Database.h"
 
 // ============================================================================
 // UTILITY FUNCTIONS (Server-Specific)
@@ -41,6 +42,11 @@ void cleanupEmptyRoom(const string& roomId) {
     if (it != g_chatRooms.end() && it->second->isEmpty()) {
         cout << "[CLEANUP] Deleting empty room: " << roomId << endl;
         g_chatRooms.erase(it);
+        
+        // Delete room from database
+        if (g_database) {
+            g_database->deleteRoom(roomId);
+        }
     }
 }
 
@@ -106,11 +112,13 @@ void handleCreateCommand(SOCKET clientSocket, const string& params) {
     }
 
     string roomId = generateRoomId();
+    string ownerUsername;
 
     // Check if client is already in a room
     {
         lock_guard<mutex> clientLock(g_clientsMutex);
         ClientInfo& client = g_clients[clientSocket];
+        ownerUsername = client.getUsername();
 
         if (!client.getRoomId().empty()) {
             // Remove from old room first
@@ -143,6 +151,11 @@ void handleCreateCommand(SOCKET clientSocket, const string& params) {
         lock_guard<mutex> clientLock(g_clientsMutex);
         g_clients[clientSocket].setRoomId(roomId);
         g_clients[clientSocket].setIsRoomOwner(true);
+    }
+
+    // Save room to database
+    if (g_database) {
+        g_database->createRoom(roomId, isPrivate, ownerUsername, password);
     }
 
     string response = "ROOM_CREATED:" + roomId + ":" +
@@ -181,8 +194,9 @@ void handleJoinCommand(SOCKET clientSocket, const string& params) {
         return;
     }
 
-    // Check if user is banned
-    if (targetRoomIt->second->isUserBanned(client.getUsername())) {
+    // Check if user is banned (check both in-memory and database)
+    if (targetRoomIt->second->isUserBanned(client.getUsername()) ||
+        (g_database && g_database->isUserBanned(roomId, client.getUsername()))) {
         sendToClient(clientSocket, "ERROR: You are banned from this room\n");
         return;
     }
@@ -230,8 +244,17 @@ void handleJoinCommand(SOCKET clientSocket, const string& params) {
     string response = "ROOM_JOINED:" + roomId + "\n";
     sendToClient(clientSocket, response);
 
-    // Send message history to the new user
-    vector<string> history = targetRoomIt->second->getMessageHistory();
+    // Send message history - first from database, then from memory
+    vector<string> history;
+    if (g_database) {
+        history = g_database->getMessageHistory(roomId, MAX_MESSAGE_HISTORY);
+    }
+    
+    // If database history is empty, use in-memory history
+    if (history.empty()) {
+        history = targetRoomIt->second->getMessageHistory();
+    }
+
     if (!history.empty()) {
         sendToClient(clientSocket, "MESSAGE_HISTORY_START\n");
         for (const string& msg : history) {
@@ -475,6 +498,11 @@ void handleBanCommand(SOCKET clientSocket, const string& params) {
         if (roomIt != g_chatRooms.end()) {
             roomIt->second->banUser(targetUsername);
 
+            // Save ban to database
+            if (g_database) {
+                g_database->addBan(roomId, targetUsername);
+            }
+
             if (targetSocket != INVALID_SOCKET) {
                 // User is currently in the room, kick them
                 sendToClient(targetSocket, getCurrentTimestamp() +
@@ -553,6 +581,11 @@ void handleTransferCommand(SOCKET clientSocket, const string& params) {
             lock_guard<mutex> clientLock(g_clientsMutex);
             g_clients[clientSocket].setIsRoomOwner(false);
             g_clients[targetSocket].setIsRoomOwner(true);
+
+            // Update owner in database
+            if (g_database) {
+                g_database->updateRoomOwner(roomId, targetUsername);
+            }
 
             string transferMsg = getCurrentTimestamp() +
                 " SYSTEM: Room ownership transferred to " +
@@ -753,6 +786,12 @@ void handleChangePasswordCommand(SOCKET clientSocket, const string& params) {
             }
 
             roomIt->second->setPassword(newPassword);
+
+            // Update password in database
+            if (g_database) {
+                g_database->updateRoomPassword(roomId, newPassword);
+            }
+
             sendToClient(clientSocket, "PASSWORD_CHANGED:" + newPassword + "\n");
 
             string sysMsg = getCurrentTimestamp() +
@@ -884,6 +923,17 @@ void broadcastMessages() {
                             message.getContent() + "\n";
                         sendToClient(message.getSenderSocket(), confirmMessage);
 
+                        // Save private message to database
+                        if (g_database) {
+                            g_database->saveMessage(
+                                message.getRoomId(),
+                                message.getSenderName(),
+                                message.getContent(),
+                                true,
+                                message.getRecipientName()
+                            );
+                        }
+
                         cout << "[PM] " << timestamp << " "
                             << message.getSenderName() << " -> "
                             << message.getRecipientName() << ": "
@@ -899,6 +949,17 @@ void broadcastMessages() {
 
                     it->second->addMessageToHistory(formattedMessage);
                     it->second->broadcast(formattedMessage, message.getSenderSocket());
+
+                    // Save message to database
+                    if (g_database) {
+                        g_database->saveMessage(
+                            message.getRoomId(),
+                            message.getSenderName(),
+                            message.getContent(),
+                            false,
+                            ""
+                        );
+                    }
 
                     cout << "[BROADCAST] Room " << message.getRoomId() << " - "
                         << timestamp << " " << message.getSenderName() << ": "

@@ -3,10 +3,18 @@
 #include "Utilities.h"
 #include "Server.h"
 #include "ClientInfo.h"
+#include "Database.h"
 
 int main() {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
+
+    // Initialize database
+    g_database = make_unique<Database>("chatserver.db");
+    if (!g_database->initialize()) {
+        cout << "[ERROR] Database initialization failed" << endl;
+        return 1;
+    }
 
     if (!initializeWinsock()) {
         return 1;
@@ -163,5 +171,9 @@ int main() {
     WSACleanup();
 
     cout << "[SHUTDOWN] Server shutdown complete" << endl;
+    
+    // Close database (unique_ptr will handle cleanup)
+    g_database.reset();
+    
     return 0;
 }

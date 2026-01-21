@@ -2,6 +2,7 @@
 #include "Common.h"
 #include "ClientInfo.h"
 #include "Message.h"
+#include "Database.h"
 
 // Global map of all chat rooms, keyed by Room ID
 extern map<string, shared_ptr<ChatRoom>> g_chatRooms;
